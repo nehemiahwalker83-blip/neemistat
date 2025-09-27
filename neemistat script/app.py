@@ -9,12 +9,13 @@ import zipfile
 from datetime import datetime
 import plotly.express as px
 import matplotlib.pyplot as plt
+from statsmodels.tsa.ar_model import AutoReg
 
 st.set_page_config(page_title="Neemistat", layout="wide")
 st.title("Neemistat — Orderflow & Statistical Forecasting Made Simple")
 st.markdown(
     "Upload intraday CSV (2 years OK). App detects basic columns and creates daily aggregates, "
-    "histograms, orderflow metrics and quantile forecasts."
+    "histograms, orderflow metrics, quantile forecasts, and next-day True Range forecast."
 )
 
 # ---------- Helpers ----------
@@ -24,7 +25,6 @@ def read_csv(file, datetime_col=None):
     if datetime_col and datetime_col in df.columns:
         df[datetime_col] = pd.to_datetime(df[datetime_col])
     else:
-        # try common names
         for cand in ["datetime","timestamp","time","date"]:
             if cand in df.columns:
                 df[cand] = pd.to_datetime(df[cand])
@@ -83,6 +83,18 @@ def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
         })
     return pd.DataFrame(rows)
 
+def forecast_true_range(daily, lookback=252):
+    """Forecast next day's True Range % using AR(1) model"""
+    df = daily.copy()
+    df['tr_percent'] = (df['high'] - df['low']) / df['close'] * 100
+    tr_series = df['tr_percent'].tail(lookback)
+    if len(tr_series) < 2:
+        return None
+    model = AutoReg(tr_series, lags=1, old_names=False)
+    model_fit = model.fit()
+    forecast = model_fit.predict(start=len(tr_series), end=len(tr_series))
+    return round(forecast.iloc[0], 3)  # rounded % value
+
 # ---------- UI Inputs ----------
 uploaded = st.file_uploader("Upload intraday CSV", type=['csv'])
 if uploaded is None:
@@ -129,7 +141,7 @@ if not all(price_cols.values()):
 with st.spinner('Aggregating daily OHLC...'):
     daily = to_daily_ohlc(df_raw, dt_col, price_cols)
 
-# ---------- Ensure numeric ----------
+# Ensure numeric
 cols_to_numeric = ['open','close','high','low','volume']
 for col in cols_to_numeric:
     if col in daily.columns:
@@ -168,6 +180,14 @@ else:
     st.line_chart(daily_of['delta'])
     st.line_chart(daily_of['imbalance'])
 
+# ---------- Next-Day True Range Forecast ----------
+st.subheader("Next-Day True Range Forecast (%)")
+true_range_forecast = forecast_true_range(daily)
+if true_range_forecast is None:
+    st.info("Not enough data to forecast True Range.")
+else:
+    st.metric(label="Predicted True Range %", value=f"{true_range_forecast}%")
+
 # Quantile Forecast
 st.subheader('Quantile-based Forecast (next day)')
 if len(quantile_list) == 0:
@@ -187,37 +207,4 @@ st.subheader('Interactive daily price chart')
 daily_plot = daily.reset_index().rename(columns={'index':'date'})
 daily_plot['date'] = pd.to_datetime(daily_plot['date'])
 fig_candle = px.line(
-    daily_plot, x='date', y=['open','high','low','close'], title='Daily OHLC (lines)'
-)
-st.plotly_chart(fig_candle, use_container_width=True)
-
-# Downloadable report
-st.subheader('Download report')
-report_name = st.text_input('Report base name', value='Neemistat_report')
-make_report = st.button('Generate & Download ZIP')
-if make_report:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w') as zf:
-        if len(quantile_list) > 0:
-            zf.writestr(f"{report_name}_forecast.csv", qdf.to_csv(index=False).encode())
-        # High histogram
-        fig = plt.figure()
-        daily['high'].plot(kind='hist', bins=50)
-        plt.title('High distribution')
-        imgbuf = io.BytesIO()
-        plt.savefig(imgbuf, format='png')
-        plt.close(fig)
-        zf.writestr(f"{report_name}_high_hist.png", imgbuf.getvalue())
-        # Low histogram
-        fig = plt.figure()
-        daily['low'].plot(kind='hist', bins=50)
-        plt.title('Low distribution')
-        imgbuf = io.BytesIO()
-        plt.savefig(imgbuf, format='png')
-        plt.close(fig)
-        zf.writestr(f"{report_name}_low_hist.png", imgbuf.getvalue())
-        # Daily sample
-        zf.writestr(f"{report_name}_daily_sample.csv", daily.tail(50).to_csv())
-        # Orderflow
-        if daily_of is not None:
-            zf.w
+    daily_plot, x='date', y=['open
