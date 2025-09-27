@@ -1,253 +1,293 @@
-# app.py - Neemistat+ (full feature set)
+# app.py — Neemistat+ v2.0 (styled)
 # Run: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-import zipfile
+import io, zipfile
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import time as t
 
-# statsmodels optional
+# Optional statsmodels (for AR(1) TR%); app still works without it
 try:
     from statsmodels.tsa.ar_model import AutoReg
-    STATS_INSTALLED = True
+    STATS_OK = True
 except Exception:
-    STATS_INSTALLED = False
+    STATS_OK = False
 
-st.set_page_config(page_title="Neemistat+", layout="wide")
-st.title("Neemistat+ — Density, HOD/LOD, Forecasting, True Range")
-st.markdown("Upload intraday CSV. Required columns: datetime, open, high, low, close. Optional: volume, tick_direction, buy_volume, sell_volume.")
+# =========================
+# Page config + dark theme
+# =========================
+st.set_page_config(page_title="Neemistat+", layout="wide", initial_sidebar_state="expanded")
 
-# --------------------
-# Helpers & processing
-# --------------------
+st.markdown("""
+<style>
+/* base */
+.block-container {max-width: 1500px; padding-top: 1rem;}
+.main, .block-container { background-color:#0b0c0f; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";}
+a {color:#10b981 !important}
+
+/* sidebar */
+section[data-testid="stSidebar"]{background:#0f1115; border-right:1px solid #1f2430;}
+section[data-testid="stSidebar"] .stRadio, section[data-testid="stSidebar"] .stSelectbox, section[data-testid="stSidebar"] .stNumberInput {margin-bottom: 0.6rem;}
+section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3{color:#fff; margin: 0.2rem 0 0.6rem 0;}
+/* button-like radios */
+div[role="radiogroup"] label{background:#151821; border:1px solid #2a3142; border-radius:12px; padding:12px 14px; margin:6px 0; color:#f3f4f6; font-weight:600; cursor:pointer;}
+div[role="radiogroup"] label:hover{border-color:#10b981; background:#121621;}
+div[role="radiogroup"] input:checked + div{color:#0b0c0f}
+div[role="radiogroup"] label[data-baseweb="radio"] {box-shadow: 0 2px 10px rgba(0,0,0,0.25);}
+
+/* title hero */
+.hero{padding:48px 16px 28px 16px; text-align:left; background: radial-gradient(1000px 400px at 60% -150px, #1a1f2a 0%, rgba(11,12,15,0) 60%);}
+.hero h1{font-size:56px; line-height:1.05; margin:0; letter-spacing:-0.02em; color:#e5e7eb;}
+.hero h1 .accent{color:#b9c1cc;}
+.hero p{color:#9aa3b2; margin-top:10px}
+.note{font-size:12px; color:#9aa3b2}
+
+/* plotly theme */
+.plotly .main-svg{background:#0b0c0f !important}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# Sidebar: controls
+# =========================
+st.sidebar.markdown("### QuantiStat V2.0")  # label like your screenshot
+st.sidebar.markdown("#### HOD/LOD")
+mode = st.sidebar.radio("", ["💲 Price-Based", "🕒 Time-Based", "✔ Level Validator"])
+
+st.sidebar.markdown("#### Bias")
+bias_mode = st.sidebar.radio("", ["📊 Prediction", "📈 Forecasting"])
+
+st.sidebar.markdown("#### Options")
+live = st.sidebar.checkbox("🔄 Updates every 2 seconds", value=False)
+lookback_years = st.sidebar.number_input("📅 Historical years for forecasting", min_value=1, max_value=5, value=2)
+lookback_days = int(252 * lookback_years)
+
+uploaded = st.sidebar.file_uploader("📂 Upload intraday CSV", type=["csv"])
+st.sidebar.markdown("---")
+
+# Column mapping UI appears after upload
+def _safe_index(lst, pred, default=0):
+    try:
+        return lst.index(next((c for c in lst if pred(c)), lst[0]))
+    except Exception:
+        return default
+
+# =========================
+# Hero / heading
+# =========================
+st.markdown(
+    """
+<div class="hero">
+  <h1>Experience The Power of <span class="accent">Neemistat+</span></h1>
+  <p>Dive into our software and see how we're bringing the power of statistical data to orderflow.</p>
+  <p class="note">Note: This software is for informational purposes only and does not constitute financial advice. Please consult a professional before making investment decisions.</p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# =========================
+# Helpers
+# =========================
 @st.cache_data
 def read_and_clean(file, datetime_hint=None):
     df = pd.read_csv(file)
     df.columns = [str(c).strip() for c in df.columns]
-    # pick datetime column
     dt_col = None
     if datetime_hint and datetime_hint in df.columns:
         dt_col = datetime_hint
     else:
         for cand in ["datetime","timestamp","time","date","ts"]:
             if cand in df.columns:
-                dt_col = cand
-                break
+                dt_col = cand; break
     if dt_col is None:
         raise ValueError("No datetime-like column found.")
-    df[dt_col] = pd.to_datetime(df[dt_col].astype(str).str.strip(), errors='coerce')
+    df[dt_col] = pd.to_datetime(df[dt_col].astype(str).str.strip(), errors="coerce")
     df = df.dropna(subset=[dt_col]).reset_index(drop=True)
-    # strip whitespace in object columns
-    for c in df.select_dtypes(include='object').columns:
+    # strip surrounding whitespace
+    for c in df.select_dtypes(include="object").columns:
         df[c] = df[c].str.strip()
     return df, dt_col
 
 @st.cache_data
 def make_daily(df, dt_col, price_cols):
-    df = df.copy()
-    # ensure numeric
+    d = df.copy()
     for c in price_cols.values():
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    df = df.dropna(subset=list(price_cols.values()))
-    df['date'] = df[dt_col].dt.date
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=list(price_cols.values()))
+    d["date"] = d[dt_col].dt.date
     agg = {
-        price_cols['open']: 'first',
-        price_cols['high']: 'max',
-        price_cols['low']: 'min',
-        price_cols['close']: 'last'
+        price_cols["open"]: "first",
+        price_cols["high"]: "max",
+        price_cols["low"]: "min",
+        price_cols["close"]: "last",
     }
-    daily = df.groupby('date').agg(agg)
+    daily = d.groupby("date").agg(agg)
     daily.index = pd.to_datetime(daily.index)
-    daily.columns = ['open','high','low','close']
-    for c in ['open','high','low','close']:
-        daily[c] = pd.to_numeric(daily[c], errors='coerce')
-    daily = daily.dropna(subset=['open','high','low','close'])
-    return daily
+    daily.columns = ["open","high","low","close"]
+    for c in ["open","high","low","close"]:
+        daily[c] = pd.to_numeric(daily[c], errors="coerce")
+    return daily.dropna()
 
 def density_map_price_based(df, dt_col, price_cols, bins_time=200, bins_price=150):
     tmp = df.copy()
-    # choose price column (close preferred)
-    price_col = price_cols.get('close') if price_cols.get('close') in tmp.columns else price_cols.get('open')
-    tmp['tod'] = tmp[dt_col].dt.hour*3600 + tmp[dt_col].dt.minute*60 + tmp[dt_col].dt.second
-    tmp['date_only'] = tmp[dt_col].dt.date
-    opens = tmp.groupby('date_only')[price_cols['open']].first().rename('day_open')
-    tmp = tmp.merge(opens, left_on='date_only', right_index=True, how='left')
-    tmp['price_offset'] = tmp[price_col] - tmp['day_open']
-    x = tmp['tod'].values
-    y = tmp['price_offset'].values
+    price_col = price_cols.get("close") if price_cols.get("close") in tmp.columns else price_cols.get("open")
+    tmp["tod"] = tmp[dt_col].dt.hour*3600 + tmp[dt_col].dt.minute*60 + tmp[dt_col].dt.second
+    tmp["date_only"] = tmp[dt_col].dt.date
+    opens = tmp.groupby("date_only")[price_cols["open"]].first().rename("day_open")
+    tmp = tmp.merge(opens, left_on="date_only", right_index=True, how="left")
+    tmp["price_offset"] = tmp[price_col] - tmp["day_open"]
+    x = tmp["tod"].values
+    y = tmp["price_offset"].values
     mask = (~np.isnan(x)) & (~np.isnan(y))
     x = x[mask]; y = y[mask]
     if len(x) == 0:
-        return None, None, None
+        return None, None, None, None
     H, xedges, yedges = np.histogram2d(x, y, bins=[bins_time, bins_price])
-    return H.T, xedges, yedges
+    # inner/median/outer = p25 / p50 / p75 of price_offset
+    p25, p50, p75 = np.nanpercentile(tmp["price_offset"].dropna(), [25,50,75]) if tmp["price_offset"].notna().any() else (None,None,None)
+    return H.T, xedges, yedges, (p25,p50,p75)
 
 def compute_hod_lod_by_bull_bear(daily):
-    df = daily.copy()
-    df['bullish'] = df['close'] > df['open']
-    bullish = df[df['bullish']]
-    bearish = df[~df['bullish']]
+    d = daily.copy()
+    d["bullish"] = d["close"] > d["open"]
+    bullish = d[d["bullish"]]
+    bearish = d[~d["bullish"]]
     return {
-        'bullish_highs': bullish['high'].values,
-        'bullish_lows': bullish['low'].values,
-        'bearish_highs': bearish['high'].values,
-        'bearish_lows': bearish['low'].values
+        "bullish_highs": bullish["high"].values,
+        "bullish_lows": bullish["low"].values,
+        "bearish_highs": bearish["high"].values,
+        "bearish_lows": bearish["low"].values,
     }
 
 def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
-    df = daily.copy()
-    df['high_off_open'] = df['high'] - df['open']
-    df['low_off_open'] = df['low'] - df['open']
-    df['close_off_open'] = df['close'] - df['open']
-    last_open = df['open'].iloc[-1]
-    q = df[['high_off_open','low_off_open','close_off_open']].tail(lookback).quantile(quantiles)
+    d = daily.copy()
+    d["high_off_open"] = d["high"] - d["open"]
+    d["low_off_open"] = d["low"] - d["open"]
+    d["close_off_open"] = d["close"] - d["open"]
+    last_open = d["open"].iloc[-1]
+    q = d[["high_off_open","low_off_open","close_off_open"]].tail(lookback).quantile(quantiles)
     rows = []
     for name in q.index:
         rows.append({
-            'quantile': float(name),
-            'forecast_high': float(last_open + q.loc[name,'high_off_open']),
-            'forecast_low': float(last_open + q.loc[name,'low_off_open']),
-            'forecast_close': float(last_open + q.loc[name,'close_off_open'])
+            "quantile": float(name),
+            "forecast_high": float(last_open + q.loc[name,"high_off_open"]),
+            "forecast_low": float(last_open + q.loc[name,"low_off_open"]),
+            "forecast_close": float(last_open + q.loc[name,"close_off_open"]),
         })
     return pd.DataFrame(rows)
 
-def true_range_ar1_with_ci(daily, lookback=504, alpha=0.05):
-    """
-    Fit AR(1) on log(TR%) and return forecast pct plus (lower, upper) for given alpha.
-    Returns (pred_pct, lower_pct, upper_pct) or (None,None,None) if not available.
-    """
-    if not STATS_INSTALLED:
+def tr_ar1_with_ci(daily, lookback=504):
+    if not STATS_OK:
         return None, None, None
-    df = daily.copy()
-    df['tr_pct'] = (df['high'] - df['low']) / df['close'] * 100
-    s = df['tr_pct'].tail(lookback).dropna()
+    d = daily.copy()
+    trpct = (d["high"] - d["low"]) / d["close"] * 100
+    s = trpct.tail(lookback).dropna()
     if len(s) < 3:
         return None, None, None
     s_log = np.log(s.replace(0, 1e-9))
-    model = AutoReg(s_log, lags=1, old_names=False)
-    res = model.fit()
-    pred_log = res.predict(start=len(s_log), end=len(s_log))
-    pred_log_val = float(pred_log.iloc[0])
-    # residual variance (sigma2)
-    sigma2 = float(getattr(res, 'sigma2', np.var(res.resid, ddof=1)))
-    # one-step forecast variance for AR(1) is sigma2 (approx)
-    se = np.sqrt(sigma2)
-    z = 1.96  # ~95%
-    lower_log = pred_log_val - z*se
-    upper_log = pred_log_val + z*se
-    pred_pct = float(np.exp(pred_log_val))
-    lower_pct = float(np.exp(lower_log))
-    upper_pct = float(np.exp(upper_log))
-    return pred_pct, lower_pct, upper_pct
+    res = AutoReg(s_log, lags=1, old_names=False).fit()
+    pred_log = float(res.predict(start=len(s_log), end=len(s_log)).iloc[0])
+    sigma2 = float(getattr(res, "sigma2", np.var(res.resid, ddof=1)))
+    se = np.sqrt(sigma2); z = 1.96
+    lower, upper = np.exp(pred_log - z*se), np.exp(pred_log + z*se)
+    return float(np.exp(pred_log)), float(lower), float(upper)
 
-# --------------------
-# Sidebar & controls
-# --------------------
-st.sidebar.header("Options")
-live = st.sidebar.checkbox("Live updates (re-run every 2s)", value=False)
-bias_mode = st.sidebar.radio("Bias selection", options=["Prediction","Forecasting"])
-mode = st.sidebar.selectbox("Mode", options=["Price-Based","Time-Based","Level Validator"])
-lookback_years = st.sidebar.number_input("Historical years for forecasting", min_value=1, max_value=5, value=2)
-lookback_days = int(252 * lookback_years)
-
-uploaded = st.file_uploader("Upload intraday CSV", type=['csv'])
+# =========================
+# Guard: need file
+# =========================
 if uploaded is None:
-    st.info("Upload intraday CSV with datetime, open, high, low, close.")
+    st.info("Upload intraday CSV with columns: datetime, open, high, low, close.")
     st.stop()
 
-# Read + column mapping UI
+# Column mapping (so any header names work)
 raw_df, dt_guess = read_and_clean(uploaded)
 cols = raw_df.columns.tolist()
-st.sidebar.markdown("### Column mapping")
-open_col = st.sidebar.selectbox("open column", options=cols, index=cols.index(next((c for c in cols if c.lower().startswith('open')), cols[0])))
-high_col = st.sidebar.selectbox("high column", options=cols, index=cols.index(next((c for c in cols if c.lower().startswith('high')), cols[0])))
-low_col = st.sidebar.selectbox("low column", options=cols, index=cols.index(next((c for c in cols if c.lower().startswith('low')), cols[0])))
-close_col = st.sidebar.selectbox("close column", options=cols, index=cols.index(next((c for c in cols if c.lower().startswith('close')), cols[0])))
-dt_col = st.sidebar.selectbox("datetime column", options=cols, index=cols.index(dt_guess))
+st.sidebar.markdown("#### Column mapping")
+open_col  = st.sidebar.selectbox("open",  cols, index=_safe_index(cols, lambda c: c.lower().startswith("open")))
+high_col  = st.sidebar.selectbox("high",  cols, index=_safe_index(cols, lambda c: c.lower().startswith("high")))
+low_col   = st.sidebar.selectbox("low",   cols, index=_safe_index(cols, lambda c: c.lower().startswith("low")))
+close_col = st.sidebar.selectbox("close", cols, index=_safe_index(cols, lambda c: c.lower().startswith("close")))
+dt_col    = st.sidebar.selectbox("datetime", cols, index=_safe_index(cols, lambda c: c == dt_guess))
+price_cols = {"open": open_col, "high": high_col, "low": low_col, "close": close_col}
 
-price_cols = {'open':open_col, 'high':high_col, 'low':low_col, 'close':close_col}
-
-# Level validator input
-levels_input = st.sidebar.text_input("Levels (comma separated) for Level Validator", value="")
+# Level Validator input
 levels = []
-if mode == "Level Validator" and levels_input.strip():
-    try:
-        levels = [float(x.strip()) for x in levels_input.split(",") if x.strip()!='']
-    except Exception:
-        st.sidebar.error("Levels must be numeric, comma-separated.")
+if mode == "✔ Level Validator":
+    lv_str = st.sidebar.text_input("Levels (comma separated)", value="")
+    if lv_str.strip():
+        try:
+            levels = [float(x.strip()) for x in lv_str.split(",") if x.strip()!=""]
+        except Exception:
+            st.sidebar.error("Levels must be numeric, comma-separated.")
 
-# --------------------
-# Aggregations
-# --------------------
-with st.spinner("Aggregating daily OHLC..."):
+# =========================
+# Build daily OHLC
+# =========================
+with st.spinner("Aggregating daily OHLC…"):
     daily = make_daily(raw_df, dt_col, price_cols)
 
-# Safety checks
-for c in ['open','high','low','close']:
-    daily[c] = pd.to_numeric(daily[c], errors='coerce')
-daily = daily.dropna(subset=['open','high','low','close'])
 if daily.empty:
-    st.error("No valid daily OHLC rows after cleaning. Check mapping or CSV format.")
+    st.error("No valid daily OHLC rows after cleaning. Check column mapping or CSV format.")
     st.stop()
 
-st.subheader("Daily OHLC — sample")
-st.dataframe(daily.tail(10))
+# =========================
+# HOD/LOD (bullish vs bearish)
+# =========================
+st.subheader("HOD / LOD (Bullish vs Bearish)")
+ca, cb = st.columns(2)
 
-# HOD/LOD split
 hodlod = compute_hod_lod_by_bull_bear(daily)
-st.subheader("HOD / LOD (bullish vs bearish)")
-colA, colB = st.columns(2)
-with colA:
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(x=hodlod['bullish_highs'], name='Bullish HOD', opacity=0.7, nbinsx=50))
-    fig.add_trace(go.Histogram(x=hodlod['bearish_highs'], name='Bearish HOD', opacity=0.6, nbinsx=50))
-    fig.update_layout(barmode='overlay', title="High of Day distribution (bullish vs bearish)")
-    st.plotly_chart(fig, use_container_width=True)
-with colB:
-    fig2 = go.Figure()
-    fig2.add_trace(go.Histogram(x=hodlod['bullish_lows'], name='Bullish LOD', opacity=0.7, nbinsx=50))
-    fig2.add_trace(go.Histogram(x=hodlod['bearish_lows'], name='Bearish LOD', opacity=0.6, nbinsx=50))
-    fig2.update_layout(barmode='overlay', title="Low of Day distribution (bullish vs bearish)")
-    st.plotly_chart(fig2, use_container_width=True)
 
-# Density map
-st.subheader("Density map")
-if mode in ["Price-Based","Time-Based"]:
-    H, xedges, yedges = density_map_price_based(raw_df, dt_col, price_cols, bins_time=200, bins_price=150)
+with ca:
+    figH = go.Figure()
+    figH.add_trace(go.Histogram(x=hodlod["bullish_highs"], name="Bullish HOD", nbinsx=50, opacity=0.75))
+    figH.add_trace(go.Histogram(x=hodlod["bearish_highs"], name="Bearish HOD", nbinsx=50, opacity=0.55))
+    figH.update_layout(barmode="overlay", title="High-of-Day Distribution", paper_bgcolor="#0b0c0f", plot_bgcolor="#0b0c0f", font=dict(color="#e5e7eb"))
+    st.plotly_chart(figH, use_container_width=True)
+with cb:
+    figL = go.Figure()
+    figL.add_trace(go.Histogram(x=hodlod["bullish_lows"], name="Bullish LOD", nbinsx=50, opacity=0.75))
+    figL.add_trace(go.Histogram(x=hodlod["bearish_lows"], name="Bearish LOD", nbinsx=50, opacity=0.55))
+    figL.update_layout(barmode="overlay", title="Low-of-Day Distribution", paper_bgcolor="#0b0c0f", plot_bgcolor="#0b0c0f", font=dict(color="#e5e7eb"))
+    st.plotly_chart(figL, use_container_width=True)
+
+# =========================
+# Density map (Price-Based / Time-Based)  with inner/median/outer lines
+# =========================
+st.subheader("Density Map")
+if mode in ["💲 Price-Based", "🕒 Time-Based"]:
+    H, xedges, yedges, bands = density_map_price_based(raw_df, dt_col, price_cols, bins_time=200, bins_price=150)
     if H is None:
-        st.info("Not enough intraday rows for density map.")
+        st.info("Not enough intraday rows to compute density map.")
     else:
         xcenters = (xedges[:-1] + xedges[1:]) / 2
         ycenters = (yedges[:-1] + yedges[1:]) / 2
-        df_tmp = raw_df.copy()
-        df_tmp['date_only'] = df_tmp[dt_col].dt.date
-        opens = df_tmp.groupby('date_only')[price_cols['open']].first().rename('day_open')
-        df_tmp = df_tmp.merge(opens, left_on='date_only', right_index=True, how='left')
-        df_tmp['price_offset'] = df_tmp[price_cols['close']] - df_tmp['day_open']
-        p25, p50, p75 = np.nanpercentile(df_tmp['price_offset'].dropna(), [25,50,75])
-        heat = go.Figure(go.Heatmap(z=H, x=xcenters, y=ycenters, colorscale='Viridis'))
-        heat.add_hline(y=p50, line=dict(color='white', width=2))
-        heat.add_hline(y=p25, line=dict(color='white', width=1, dash='dash'))
-        heat.add_hline(y=p75, line=dict(color='white', width=1, dash='dash'))
-        if mode == "Time-Based":
-            # convert x ticks to hh:mm labels
+        p25, p50, p75 = bands
+        heat = go.Figure(go.Heatmap(z=H, x=xcenters, y=ycenters, colorscale="Viridis", colorbar=dict(title="Count")))
+        if p50 is not None:
+            heat.add_hline(y=p50, line=dict(color="white", width=2), name="Median")
+        if p25 is not None and p75 is not None:
+            heat.add_hline(y=p25, line=dict(color="white", width=1, dash="dash"), name="Inner")
+            heat.add_hline(y=p75, line=dict(color="white", width=1, dash="dash"), name="Outer")
+
+        if mode == "🕒 Time-Based":
             xticks = [int(x) for x in np.linspace(xcenters.min(), xcenters.max(), 6)]
-            xticklabels = []
+            xtlabels = []
             for s in xticks:
                 hh = int(s//3600); mm = int((s%3600)//60)
-                xticklabels.append(f"{hh:02d}:{mm:02d}")
-            heat.update_layout(xaxis=dict(tickmode='array', tickvals=xticks, ticktext=xticklabels))
-        heat.update_layout(title="Density map (time vs price offset)")
+                xtlabels.append(f"{hh:02d}:{mm:02d}")
+            heat.update_layout(xaxis=dict(tickmode="array", tickvals=xticks, ticktext=xtlabels))
+
+        heat.update_layout(title="Time vs Price Offset", paper_bgcolor="#0b0c0f", plot_bgcolor="#0b0c0f", font=dict(color="#e5e7eb"))
         st.plotly_chart(heat, use_container_width=True)
 else:
-    # Level validator
     st.subheader("Level Validator")
     if not levels:
         st.info("Enter levels in the sidebar to compute historical hit rates.")
@@ -255,94 +295,71 @@ else:
         recent = daily.tail(lookback_days)
         rows = []
         for lvl in levels:
-            touched = ((recent['low'] <= lvl) & (recent['high'] >= lvl)).sum()
-            pct = touched / len(recent) * 100.0 if len(recent)>0 else np.nan
-            rows.append({'level': lvl, 'hit_rate_%': pct})
+            touched = ((recent["low"] <= lvl) & (recent["high"] >= lvl)).sum()
+            pct = (touched / len(recent) * 100.0) if len(recent) else np.nan
+            rows.append({"level": lvl, "hit_rate_%": pct})
         st.dataframe(pd.DataFrame(rows))
 
-# Next-day True Range (pct & points) + TR plot with forecast & CI
-st.subheader("Next-day True Range")
-if STATS_INSTALLED:
-    pred_pct, lower_pct, upper_pct = true_range_ar1_with_ci(daily, lookback=lookback_days, alpha=0.05)
-    if pred_pct is None:
-        st.info("Not enough history for AR(1). Using persistence.")
-        pred_pct = (daily['high'] - daily['low']).div(daily['close']).mul(100).iloc[-1]
-        lower_pct = upper_pct = None
-else:
-    pred_pct = (daily['high'] - daily['low']).div(daily['close']).mul(100).iloc[-1]
-    lower_pct = upper_pct = None
-
-last_close = float(daily['close'].iloc[-1])
-pred_points = last_close * (pred_pct/100.0)
-colp, colq = st.columns(2)
-colp.metric("TR (percent)", f"{pred_pct:.3f}%")
-colq.metric("TR (points)", f"{pred_points:.4f}")
-
-# TR historical plot with forecast point & CI
-tr_hist = (daily['high'] - daily['low'])/daily['close']*100
-fig_tr = go.Figure()
-fig_tr.add_trace(go.Scatter(x=tr_hist.index, y=tr_hist.values, mode='lines', name='Historical TR%'))
-if pred_pct is not None:
-    # put forecast as next-day point at date = last_date + 1 day
-    next_date = tr_hist.index[-1] + pd.Timedelta(days=1)
-    fig_tr.add_trace(go.Scatter(x=[next_date], y=[pred_pct], mode='markers', name='AR1 forecast', marker=dict(size=10, color='red')))
-    if lower_pct is not None and upper_pct is not None:
-        fig_tr.add_trace(go.Scatter(x=[next_date,next_date], y=[lower_pct, upper_pct], mode='lines+markers', name='95% CI', marker=dict(size=6, color='orange')))
-fig_tr.update_layout(title='True Range % history with next-day forecast', yaxis_title='TR %')
-st.plotly_chart(fig_tr, use_container_width=True)
-
-# Quantile forecast
-st.subheader("Quantile forecast")
+# =========================
+# Forecasting using 2 years (default) — Quantile forecast off last open
+# =========================
+st.subheader("Quantile Forecast (applied to last open)")
 qdf = quantile_forecast(daily, lookback=lookback_days, quantiles=[0.05,0.25,0.5,0.75,0.95])
 if qdf is None or qdf.empty:
     st.info("Insufficient history for quantile forecast.")
 else:
     st.dataframe(qdf)
-    figq = px.line(qdf, x='quantile', y=['forecast_high','forecast_close','forecast_low'], markers=True)
-    figq.update_layout(title='Quantile bands (applied to last open)')
-    st.plotly_chart(figq, use_container_width=True)
+    figQ = px.line(qdf, x="quantile", y=["forecast_high","forecast_close","forecast_low"], markers=True)
+    figQ.update_layout(title="Quantile Bands", paper_bgcolor="#0b0c0f", plot_bgcolor="#0b0c0f", font=dict(color="#e5e7eb"))
+    st.plotly_chart(figQ, use_container_width=True)
 
-# Candlestick (Plotly) chart for daily OHLC
-st.subheader("Candlestick / OHLC chart")
-daily_plot = daily.reset_index().rename(columns={'index':'date'})
-# candlestick with plotly.graph_objects
-fig_candle = go.Figure(data=[go.Candlestick(x=daily_plot['date'],
-                open=daily_plot['open'], high=daily_plot['high'],
-                low=daily_plot['low'], close=daily_plot['close'],
-                name='OHLC')])
-fig_candle.update_layout(title='Daily Candlestick', xaxis_title='Date')
-st.plotly_chart(fig_candle, use_container_width=True)
+# =========================
+# Next-day True Range (percent & points)
+# =========================
+st.subheader("Next-day True Range")
+if STATS_OK:
+    pred_pct, lo_pct, hi_pct = tr_ar1_with_ci(daily, lookback=lookback_days)
+    if pred_pct is None:
+        st.info("Not enough history for AR(1). Using last TR% as persistence.")
+        tr_hist = (daily["high"] - daily["low"]).div(daily["close"])*100
+        pred_pct = float(tr_hist.iloc[-1]); lo_pct = hi_pct = None
+else:
+    tr_hist = (daily["high"] - daily["low"]).div(daily["close"])*100
+    pred_pct = float(tr_hist.iloc[-1]); lo_pct = hi_pct = None
 
-# Downloadable report
-st.subheader("Download report")
-report_name = st.text_input("Report name", value="Neemistat_report")
-if st.button("Generate ZIP report"):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w') as zf:
-        if not qdf.empty:
-            zf.writestr(f"{report_name}_quantile.csv", qdf.to_csv(index=False).encode())
-        zf.writestr(f"{report_name}_daily_sample.csv", daily.tail(50).to_csv().encode())
-        for cname in ['high','low']:
-            fig, ax = plt.subplots()
-            daily[cname].plot(kind='hist', bins=50, ax=ax)
-            ax.set_title(f"{cname.capitalize()} distribution")
-            imgb = io.BytesIO()
-            plt.savefig(imgb, format='png')
-            plt.close(fig)
-            zf.writestr(f"{report_name}_{cname}_hist.png", imgb.getvalue())
-        try:
-            df_of = compute_orderflow(raw_df, dt_col)
-            if df_of is not None:
-                zf.writestr(f"{report_name}_orderflow.csv", df_of.to_csv().encode())
-        except Exception:
-            pass
-    buf.seek(0)
-    st.download_button("Download ZIP", data=buf, file_name=f"{report_name}.zip", mime="application/zip")
+last_close = float(daily["close"].iloc[-1])
+pred_points = last_close * (pred_pct/100.0)
 
-# Live updates (re-run every 2s)
+c1, c2 = st.columns(2)
+c1.metric("TR (percent)", f"{pred_pct:.3f}%")
+c2.metric("TR (points)", f"{pred_points:.4f}")
+
+# TR history + forecast marker
+tr_hist = (daily["high"] - daily["low"]).div(daily["close"])*100
+figTR = go.Figure()
+figTR.add_trace(go.Scatter(x=tr_hist.index, y=tr_hist.values, mode="lines", name="Historical TR%"))
+next_date = tr_hist.index[-1] + pd.Timedelta(days=1)
+figTR.add_trace(go.Scatter(x=[next_date], y=[pred_pct], mode="markers", name="Forecast", marker=dict(size=10)))
+if lo_pct is not None and hi_pct is not None:
+    figTR.add_trace(go.Scatter(x=[next_date, next_date], y=[lo_pct, hi_pct], mode="lines+markers", name="95% CI"))
+figTR.update_layout(title="True Range % with Next-day Forecast", yaxis_title="TR %", paper_bgcolor="#0b0c0f", plot_bgcolor="#0b0c0f", font=dict(color="#e5e7eb"))
+st.plotly_chart(figTR, use_container_width=True)
+
+# =========================
+# Candlestick (for quick context)
+# =========================
+st.subheader("Daily Candlestick")
+dp = daily.reset_index().rename(columns={"index":"date"})
+figC = go.Figure(data=[go.Candlestick(x=dp["date"], open=dp["open"], high=dp["high"], low=dp["low"], close=dp["close"])])
+figC.update_layout(title="Daily OHLC", xaxis_title="Date", paper_bgcolor="#0b0c0f", plot_bgcolor="#0b0c0f", font=dict(color="#e5e7eb"))
+st.plotly_chart(figC, use_container_width=True)
+
+# =========================
+# Live updates (every 2s)
+# =========================
 if live:
     t.sleep(2)
     st.experimental_rerun()
 
 st.markdown("---")
-st.caption("Neemistat+ — density, HOD/LOD split, quantile forecasting, AR(1) True Range, candlestick chart.")
+st.caption("Neemistat+ — Density map (inner/median/outer), HOD/LOD split, 2yr forecasting, Bias + Modes, Next-day TR%, Live refresh.")
