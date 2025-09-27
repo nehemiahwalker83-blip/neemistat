@@ -1,11 +1,10 @@
-# app.py — Neemistat+ v2.2 (Zone-Based Density Map)
+# app.py — Neemistat+ v2.3 (Zone-Based Density Map with Real Prices)
 # Run: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import StringIO
-from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 import time as t
@@ -39,7 +38,7 @@ div[role="radiogroup"] label{background:#151821; border:1px solid #2a3142; borde
 # =========================
 # Sidebar controls
 # =========================
-st.sidebar.markdown("### Neemistat+ V2.2")
+st.sidebar.markdown("### Neemistat+ V2.3")
 mode = st.sidebar.radio("HOD/LOD Mode", ["💲 Price-Based", "🕒 Time-Based", "✔ Level Validator"])
 bias_mode = st.sidebar.radio("Bias", ["📊 Prediction", "📈 Forecasting"])
 live = st.sidebar.checkbox("🔄 Updates every 2 seconds", value=False)
@@ -66,7 +65,7 @@ st.markdown("""
 @st.cache_data
 def read_and_clean(file, datetime_hint=None):
     df = pd.read_csv(file)
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [str(c).strip().lower() for c in df.columns]
     dt_col = None
     for cand in ["datetime","timestamp","time","date","ts"]:
         if cand in df.columns:
@@ -94,15 +93,13 @@ def make_daily(df, dt_col, price_cols):
 
 def density_map_zone_based(df, dt_col, price_cols):
     tmp = df.copy()
-    price_col = price_cols.get("close") if price_cols.get("close") in tmp.columns else price_cols.get("open")
-    tmp["date_only"] = tmp[dt_col].dt.date
-    opens = tmp.groupby("date_only")[price_cols["open"]].first().rename("day_open")
-    tmp = tmp.merge(opens, left_on="date_only", right_index=True, how="left")
-    tmp["price_offset"] = tmp[price_col] - tmp["day_open"]
-    if tmp["price_offset"].isna().all():
-        return None, None, None
-    p25, p50, p75 = np.nanpercentile(tmp["price_offset"].dropna(), [25,50,75])
-    return (p25, p50, p75), tmp[price_col]
+    price_col = price_cols.get("close")
+    if price_col not in tmp.columns:
+        return None, None
+    prices = tmp[price_col].dropna()
+    if prices.empty: return None, None
+    p25, p50, p75 = np.percentile(prices, [25, 50, 75])
+    return (p25, p50, p75), prices
 
 def compute_hod_lod_by_bull_bear(daily):
     d = daily.copy()
@@ -148,23 +145,20 @@ def tr_ar1_with_ci(daily, lookback=504):
 # File handling
 # =========================
 if uploaded is not None:
-    raw_df, dt_guess = read_and_clean(uploaded)
+    raw_df, dt_col = read_and_clean(uploaded)
 elif use_demo:
     demo_csv = StringIO("""datetime,open,high,low,close
-2025-01-02 09:30:00,17450,17460,17440,17455
-2025-01-02 09:31:00,17455,17470,17450,17465
-2025-01-02 09:32:00,17465,17480,17460,17475
-2025-01-02 09:33:00,17475,17485,17470,17480
-2025-01-02 09:34:00,17480,17490,17475,17485
+2025-01-02 09:30:00,6060,6065,6055,6062.5
+2025-01-02 09:31:00,6062.5,6068,6060,6066.8
+2025-01-02 09:32:00,6066.8,6072,6064,6069
+2025-01-02 09:33:00,6069,6075,6066,6072
 """)
-    raw_df, dt_guess = read_and_clean(demo_csv)
+    raw_df, dt_col = read_and_clean(demo_csv)
 else:
     st.info("Upload intraday CSV or click **Use Demo Data** in the sidebar.")
     st.stop()
 
-cols = raw_df.columns.tolist()
-price_cols = {"open": "open", "high": "high", "low": "low", "close": "close"}
-dt_col = "datetime" if "datetime" in cols else cols[0]
+price_cols = {"open":"open","high":"high","low":"low","close":"close"}
 
 # =========================
 # Daily OHLC
@@ -174,38 +168,37 @@ st.subheader("📅 Daily OHLC Sample")
 st.dataframe(daily.tail(10))
 
 # =========================
-# HOD/LOD
-# =========================
-st.subheader("HOD / LOD (Bullish vs Bearish)")
-hodlod = compute_hod_lod_by_bull_bear(daily)
-figH = go.Figure()
-figH.add_trace(go.Histogram(x=hodlod["bullish_highs"], name="Bullish HOD", nbinsx=50))
-figH.add_trace(go.Histogram(x=hodlod["bearish_highs"], name="Bearish HOD", nbinsx=50))
-figH.update_layout(barmode="overlay")
-st.plotly_chart(figH, use_container_width=True)
-
-# =========================
-# Zone-Based Density Map
+# Zone-Based Density Map (with real MNQ prices)
 # =========================
 st.subheader("Density Map - Zone Based")
 bands, prices = density_map_zone_based(raw_df, dt_col, price_cols)
+
 if bands is not None:
     p25, p50, p75 = bands
-    zone_levels = np.linspace(prices.min(), prices.max(), 6)
+    # Use actual quantiles of MNQ prices for levels
+    zone_levels = np.quantile(prices, [0.1, 0.25, 0.5, 0.75, 0.9])
 
     figZ = go.Figure()
     for lvl in zone_levels:
-        figZ.add_hline(y=lvl, line=dict(color="white", width=1, dash="dot"))
+        figZ.add_hline(
+            y=lvl,
+            line=dict(color="white", width=1, dash="dot"),
+            annotation_text=f"{lvl:.2f}",
+            annotation_position="right"
+        )
 
+    # Median, Inner, Outer
     figZ.add_hline(y=p50, line=dict(color="green", width=2), annotation_text="Median Line")
     figZ.add_hline(y=p25, line=dict(color="white", width=1, dash="dash"), annotation_text="Inner Line")
     figZ.add_hline(y=p75, line=dict(color="white", width=1, dash="dash"), annotation_text="Outer Line")
 
-    figZ.update_layout(title="Density Map - Zone Based",
-                       yaxis_title="Zone Levels",
-                       paper_bgcolor="#000000",
-                       plot_bgcolor="#000000",
-                       font=dict(color="white"))
+    figZ.update_layout(
+        title="Density Map - Zone Based",
+        yaxis_title="MNQ Price",
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
+        font=dict(color="white")
+    )
     st.plotly_chart(figZ, use_container_width=True)
 
 # =========================
