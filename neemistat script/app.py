@@ -207,4 +207,27 @@ st.subheader('Interactive daily price chart')
 daily_plot = daily.reset_index().rename(columns={'index':'date'})
 daily_plot['date'] = pd.to_datetime(daily_plot['date'])
 fig_candle = px.line(
-    daily_plot, x='date', y=['open
+    daily_plot,
+    x='date',
+    y=['open','high','low','close'],
+    title='Daily OHLC (lines)'
+)
+st.plotly_chart(fig_candle, use_container_width=True)
+
+# ---------- Downloadable report ----------
+st.subheader('Download report')
+report_name = st.text_input('Report base name', value='Neemistat_report')
+make_report = st.button('Generate & Download ZIP')
+if make_report:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        if len(quantile_list) > 0:
+            csv_bytes = qdf.to_csv(index=False).encode()
+            zf.writestr(f"{report_name}_forecast.csv", csv_bytes)
+        fig = plt.figure()
+        daily['high'].plot(kind='hist', bins=50)
+        plt.title('High distribution')
+        imgbuf = io.BytesIO()
+        plt.savefig(imgbuf, format='png')
+        plt.close(fig)
+        zf.writestr(f"{
