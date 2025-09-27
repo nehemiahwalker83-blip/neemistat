@@ -195,4 +195,35 @@ if len(quantile_list) == 0:
 else:
     with st.spinner('Computing quantile forecast...'):
         qdf = quantile_forecast(daily, lookback=lookback, quantiles=sorted(quantile_list))
-    st.dataframe(qdf
+    st.dataframe(qdf)
+
+# Interactive daily chart
+st.subheader('Interactive daily price chart')
+fig_candle = px.line(
+    daily[['open','high','low','close']].reset_index(), x='index', y=['open','high','low','close'], title='Daily OHLC (lines)'
+)
+st.plotly_chart(fig_candle, use_container_width=True)
+
+# ---------- Downloadable report ----------
+st.subheader('Download report')
+report_name = st.text_input('Report base name', value='Neemistat_report')
+make_report = st.button('Generate & Download ZIP')
+if make_report:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        # forecast CSV
+        if len(quantile_list) > 0:
+            csv_bytes = qdf.to_csv(index=False).encode()
+            zf.writestr(f"{report_name}_forecast.csv", csv_bytes)
+        # save histograms as PNG
+        # high
+        fig = plt.figure()
+        daily['high'].plot(kind='hist', bins=50)
+        plt.title('High distribution')
+        imgbuf = io.BytesIO()
+        plt.savefig(imgbuf, format='png')
+        plt.close(fig)
+        zf.writestr(f"{report_name}_high_hist.png", imgbuf.getvalue())
+        # low
+        fig = plt.figure()
+       
