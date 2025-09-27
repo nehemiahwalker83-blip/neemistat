@@ -1,5 +1,5 @@
 # Neemistat_App_Streamlit - Streamlit single-file app
-# Simple, clear, and runnable. Drop into app.py and run with: streamlit run app.py
+# Drop into app.py and run with: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
@@ -12,7 +12,10 @@ import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Neemistat", layout="wide")
 st.title("Neemistat — Orderflow & Statistical Forecasting Made Simple")
-st.markdown("Upload intraday CSV (2 years OK). App detects basic columns and creates daily aggregates, histograms, orderflow metrics and quantile forecasts.")
+st.markdown(
+    "Upload intraday CSV (2 years OK). App detects basic columns and creates daily aggregates, "
+    "histograms, orderflow metrics and quantile forecasts."
+)
 
 # ---------- Helpers ----------
 @st.cache_data
@@ -83,7 +86,10 @@ def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
 # ---------- UI Inputs ----------
 uploaded = st.file_uploader("Upload intraday CSV", type=['csv'])
 if uploaded is None:
-    st.info("Upload a CSV with at least datetime, open, high, low, close. Optional: buy_volume & sell_volume OR tick_direction & volume for orderflow.")
+    st.info(
+        "Upload a CSV with at least datetime, open, high, low, close. "
+        "Optional: buy_volume & sell_volume OR tick_direction & volume for orderflow."
+    )
     st.stop()
 
 with st.spinner('Reading file...'):
@@ -104,10 +110,16 @@ price_defaults = {
 st.sidebar.header('Column mapping')
 price_cols = {}
 for k,v in price_defaults.items():
-    price_cols[k] = st.sidebar.selectbox(f"{k} column", options=[None]+cols, index=cols.index(v) if v in cols else 0)
+    price_cols[k] = st.sidebar.selectbox(
+        f"{k} column", options=[None]+cols, index=cols.index(v) if v in cols else 0
+    )
 
-lookback = st.sidebar.number_input('Lookback (days) for quantile forecast', min_value=30, max_value=2000, value=500, step=10)
-quantile_list = st.sidebar.multiselect('Quantiles to include', options=[0.01,0.05,0.1,0.25,0.5,0.75,0.9,0.95,0.99], default=[0.05,0.25,0.5,0.75,0.95])
+lookback = st.sidebar.number_input(
+    'Lookback (days) for quantile forecast', min_value=30, max_value=2000, value=500, step=10
+)
+quantile_list = st.sidebar.multiselect(
+    'Quantiles to include', options=[0.01,0.05,0.1,0.25,0.5,0.75,0.9,0.95,0.99], default=[0.05,0.25,0.5,0.75,0.95]
+)
 
 if not all(price_cols.values()):
     st.error('Please map all price columns in the sidebar (open, high, low, close).')
@@ -117,8 +129,8 @@ if not all(price_cols.values()):
 with st.spinner('Aggregating daily OHLC...'):
     daily = to_daily_ohlc(df_raw, dt_col, price_cols)
 
-# ---------- FIX: Force numeric OHLCV ----------
-cols_to_numeric = ['open', 'close', 'high', 'low', 'volume']
+# ---------- Ensure numeric ----------
+cols_to_numeric = ['open','close','high','low','volume']
 for col in cols_to_numeric:
     if col in daily.columns:
         daily[col] = pd.to_numeric(daily[col], errors='coerce')
@@ -132,8 +144,12 @@ daily['bearish'] = daily['close'] < daily['open']
 
 # High/Low histograms
 st.subheader('High/Low Distributions (bullish vs bearish)')
-fig_high = px.histogram(daily, x='high', color=daily['bullish'].map({True:'bullish',False:'bearish'}), nbins=50, title='High values by day type')
-fig_low = px.histogram(daily, x='low', color=daily['bullish'].map({True:'bullish',False:'bearish'}), nbins=50, title='Low values by day type')
+fig_high = px.histogram(
+    daily, x='high', color=daily['bullish'].map({True:'bullish',False:'bearish'}), nbins=50, title='High values by day type'
+)
+fig_low = px.histogram(
+    daily, x='low', color=daily['bullish'].map({True:'bullish',False:'bearish'}), nbins=50, title='Low values by day type'
+)
 col1, col2 = st.columns(2)
 with col1:
     st.plotly_chart(fig_high, use_container_width=True)
@@ -144,7 +160,9 @@ with col2:
 st.subheader('Orderflow (if present)')
 daily_of = compute_orderflow(df_raw, dt_col)
 if daily_of is None:
-    st.info('No recognized orderflow columns found. Provide buy_volume & sell_volume OR tick_direction & volume to compute orderflow.')
+    st.info(
+        'No recognized orderflow columns found. Provide buy_volume & sell_volume OR tick_direction & volume to compute orderflow.'
+    )
 else:
     st.dataframe(daily_of.tail(10))
     st.line_chart(daily_of['delta'])
@@ -158,13 +176,19 @@ else:
     with st.spinner('Computing quantile forecast...'):
         qdf = quantile_forecast(daily, lookback=lookback, quantiles=sorted(quantile_list))
     st.dataframe(qdf)
-    fig = px.line(qdf, x='quantile', y=['forecast_high','forecast_close','forecast_low'], markers=True)
+    fig = px.line(
+        qdf, x='quantile', y=['forecast_high','forecast_close','forecast_low'], markers=True
+    )
     fig.update_layout(title='Forecast bands vs quantile (applied to last open)')
     st.plotly_chart(fig, use_container_width=True)
 
 # Interactive daily chart
 st.subheader('Interactive daily price chart')
-fig_candle = px.line(daily[['open','high','low','close']].reset_index(), x='index', y=['open','high','low','close'], title='Daily OHLC (lines)')
+daily_plot = daily.reset_index().rename(columns={'index':'date'})
+daily_plot['date'] = pd.to_datetime(daily_plot['date'])
+fig_candle = px.line(
+    daily_plot, x='date', y=['open','high','low','close'], title='Daily OHLC (lines)'
+)
 st.plotly_chart(fig_candle, use_container_width=True)
 
 # Downloadable report
@@ -176,6 +200,7 @@ if make_report:
     with zipfile.ZipFile(buf, 'w') as zf:
         if len(quantile_list) > 0:
             zf.writestr(f"{report_name}_forecast.csv", qdf.to_csv(index=False).encode())
+        # High histogram
         fig = plt.figure()
         daily['high'].plot(kind='hist', bins=50)
         plt.title('High distribution')
@@ -183,7 +208,7 @@ if make_report:
         plt.savefig(imgbuf, format='png')
         plt.close(fig)
         zf.writestr(f"{report_name}_high_hist.png", imgbuf.getvalue())
-
+        # Low histogram
         fig = plt.figure()
         daily['low'].plot(kind='hist', bins=50)
         plt.title('Low distribution')
@@ -191,12 +216,8 @@ if make_report:
         plt.savefig(imgbuf, format='png')
         plt.close(fig)
         zf.writestr(f"{report_name}_low_hist.png", imgbuf.getvalue())
-
+        # Daily sample
         zf.writestr(f"{report_name}_daily_sample.csv", daily.tail(50).to_csv())
+        # Orderflow
         if daily_of is not None:
-            zf.writestr(f"{report_name}_orderflow.csv", daily_of.to_csv())
-    buf.seek(0)
-    st.download_button(label='Download Neemistat report (ZIP)', data=buf, file_name=f"{report_name}.zip", mime='application/zip')
-
-st.markdown('---')
-st.caption('Neemistat — lightweight Streamlit rebrand of QuantiStat. Modify quantile logic or group-by rules to fit your workflow.')
+            zf.w
