@@ -63,8 +63,6 @@ def compute_orderflow(df, datetime_col):
     daily_of['imbalance'] = daily_of['delta'] / (daily_of.get('buy_volume', daily_of.get('total_volume', 1)) + 1e-9)
     return daily_of
 
-# Quantile forecasting: compute historical (target - open) values over lookback and produce next-day bands
-
 def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
     df = daily.copy()
     df['high_off_open'] = df['high'] - df['open']
@@ -72,7 +70,6 @@ def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
     df['close_off_open'] = df['close'] - df['open']
     last_open = df['open'].iloc[-1]
     q = df[['high_off_open','low_off_open','close_off_open']].tail(lookback).quantile(quantiles)
-    # Build forecast dataframe for next day
     rows = []
     for name in q.index:
         rows.append({
@@ -112,7 +109,6 @@ for k,v in price_defaults.items():
 lookback = st.sidebar.number_input('Lookback (days) for quantile forecast', min_value=30, max_value=2000, value=500, step=10)
 quantile_list = st.sidebar.multiselect('Quantiles to include', options=[0.01,0.05,0.1,0.25,0.5,0.75,0.9,0.95,0.99], default=[0.05,0.25,0.5,0.75,0.95])
 
-# Validate price cols
 if not all(price_cols.values()):
     st.error('Please map all price columns in the sidebar (open, high, low, close).')
     st.stop()
@@ -121,13 +117,20 @@ if not all(price_cols.values()):
 with st.spinner('Aggregating daily OHLC...'):
     daily = to_daily_ohlc(df_raw, dt_col, price_cols)
 
+# ---------- FIX: Force numeric OHLCV ----------
+cols_to_numeric = ['open', 'close', 'high', 'low', 'volume']
+for col in cols_to_numeric:
+    if col in daily.columns:
+        daily[col] = pd.to_numeric(daily[col], errors='coerce')
+
 st.subheader('Daily OHLC — sample')
 st.dataframe(daily.tail(10))
 
-# Bullish days
+# Bullish / Bearish
 daily['bullish'] = daily['close'] > daily['open']
+daily['bearish'] = daily['close'] < daily['open']
 
-# HOD/LOD histograms (we'll show distributions of high and low values split by bullish)
+# High/Low histograms
 st.subheader('High/Low Distributions (bullish vs bearish)')
 fig_high = px.histogram(daily, x='high', color=daily['bullish'].map({True:'bullish',False:'bearish'}), nbins=50, title='High values by day type')
 fig_low = px.histogram(daily, x='low', color=daily['bullish'].map({True:'bullish',False:'bearish'}), nbins=50, title='Low values by day type')
@@ -155,7 +158,6 @@ else:
     with st.spinner('Computing quantile forecast...'):
         qdf = quantile_forecast(daily, lookback=lookback, quantiles=sorted(quantile_list))
     st.dataframe(qdf)
-    # Plot forecast bands
     fig = px.line(qdf, x='quantile', y=['forecast_high','forecast_close','forecast_low'], markers=True)
     fig.update_layout(title='Forecast bands vs quantile (applied to last open)')
     st.plotly_chart(fig, use_container_width=True)
@@ -165,19 +167,15 @@ st.subheader('Interactive daily price chart')
 fig_candle = px.line(daily[['open','high','low','close']].reset_index(), x='index', y=['open','high','low','close'], title='Daily OHLC (lines)')
 st.plotly_chart(fig_candle, use_container_width=True)
 
-# ---------- Downloadable report (CSV + hist images zipped) ----------
+# Downloadable report
 st.subheader('Download report')
 report_name = st.text_input('Report base name', value='Neemistat_report')
 make_report = st.button('Generate & Download ZIP')
 if make_report:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
-        # forecast CSV
         if len(quantile_list) > 0:
-            csv_bytes = qdf.to_csv(index=False).encode()
-            zf.writestr(f"{report_name}_forecast.csv", csv_bytes)
-        # save histograms as PNG
-        # high
+            zf.writestr(f"{report_name}_forecast.csv", qdf.to_csv(index=False).encode())
         fig = plt.figure()
         daily['high'].plot(kind='hist', bins=50)
         plt.title('High distribution')
@@ -185,7 +183,7 @@ if make_report:
         plt.savefig(imgbuf, format='png')
         plt.close(fig)
         zf.writestr(f"{report_name}_high_hist.png", imgbuf.getvalue())
-        # low
+
         fig = plt.figure()
         daily['low'].plot(kind='hist', bins=50)
         plt.title('Low distribution')
@@ -193,9 +191,8 @@ if make_report:
         plt.savefig(imgbuf, format='png')
         plt.close(fig)
         zf.writestr(f"{report_name}_low_hist.png", imgbuf.getvalue())
-        # daily ohlc sample
+
         zf.writestr(f"{report_name}_daily_sample.csv", daily.tail(50).to_csv())
-        # orderflow if available
         if daily_of is not None:
             zf.writestr(f"{report_name}_orderflow.csv", daily_of.to_csv())
     buf.seek(0)
