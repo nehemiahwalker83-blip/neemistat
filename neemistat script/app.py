@@ -1,4 +1,4 @@
-# app.py — Neemistat+ v3.0
+# app.py — Neemistat+ v4.0 (VW-KDE for 1-minute entries)
 # Run: streamlit run app.py
 
 import streamlit as st
@@ -9,12 +9,12 @@ import plotly.graph_objects as go
 import plotly.express as px
 import time as t
 
-# Optional statsmodels (AR(1) for TR%)
+# Optional: AR(1) for True Range via statsmodels
 try:
     from statsmodels.tsa.ar_model import AutoReg
-    STATS_OK = True
+    STATS_AR_OK = True
 except Exception:
-    STATS_OK = False
+    STATS_AR_OK = False
 
 # =========================
 # Page config + dark theme
@@ -23,13 +23,11 @@ st.set_page_config(page_title="Neemistat+", layout="wide", initial_sidebar_state
 
 st.markdown("""
 <style>
-.block-container {max-width: 1500px; padding-top: 0.5rem;}
+.block-container {max-width: 1500px; padding-top: .5rem;}
 .main, .block-container { background-color:#0b0c0f; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto;}
 section[data-testid="stSidebar"]{background:#0f1115; border-right:1px solid #1f2430;}
-/* button-like radios */
 div[role="radiogroup"] label{background:#151821; border:1px solid #2a3142; border-radius:12px; padding:12px 14px; margin:6px 0; color:#f3f4f6; font-weight:600;}
 div[role="radiogroup"] label:hover{border-color:#10b981; background:#121621;}
-/* hero */
 .hero{padding:34px 16px 14px 16px; background: radial-gradient(1000px 380px at 60% -150px, #1a1f2a 0%, rgba(11,12,15,0) 60%);}
 .hero h1{font-size:48px; font-weight:800; color:#e5e7eb; margin:0;}
 .hero h1 .accent{color:#b9c1cc;}
@@ -41,7 +39,7 @@ div[role="radiogroup"] label:hover{border-color:#10b981; background:#121621;}
 # =========================
 # Sidebar controls
 # =========================
-st.sidebar.markdown("### Neemistat+")
+st.sidebar.markdown("### Neemistat+ v4.0")
 st.sidebar.markdown("#### HOD/LOD")
 mode = st.sidebar.radio("", ["💲 Price-Based", "🕒 Time-Based", "✔ Level Validator"])
 
@@ -86,7 +84,7 @@ def read_and_clean(file, datetime_hint=None):
         raise ValueError("No datetime-like column found.")
     df[dt_col] = pd.to_datetime(df[dt_col].astype(str).str.strip(), errors="coerce")
     df = df.dropna(subset=[dt_col]).reset_index(drop=True)
-    # trim objects
+    # trim strings
     for c in df.select_dtypes(include="object").columns:
         df[c] = df[c].str.strip()
     return df, dt_col
@@ -102,8 +100,8 @@ def make_daily(df, dt_col, price_cols):
     agg = {
         price_cols["open"]: "first",
         price_cols["high"]: "max",
-        price_cols["low"]: "min",
-        price_cols["close"]: "last",
+        price_cols["low"]:  "min",
+        price_cols["close"]:"last",
     }
     daily = d.groupby("date").agg(agg)
     daily.index = pd.to_datetime(daily.index)
@@ -115,26 +113,24 @@ def make_daily(df, dt_col, price_cols):
 def compute_hod_lod_by_bull_bear(daily):
     d = daily.copy()
     d["bullish"] = d["close"] > d["open"]
-    bullish = d[d["bullish"]]
-    bearish = d[~d["bullish"]]
     return {
-        "bullish_highs": bullish["high"].values,
-        "bullish_lows": bullish["low"].values,
-        "bearish_highs": bearish["high"].values,
-        "bearish_lows": bearish["low"].values,
+        "bullish_highs": d[d["bullish"]]["high"].values,
+        "bullish_lows":  d[d["bullish"]]["low"].values,
+        "bearish_highs": d[~d["bullish"]]["high"].values,
+        "bearish_lows":  d[~d["bullish"]]["low"].values,
     }
 
 def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
     d = daily.copy()
-    d["high_off_open"] = d["high"] - d["open"]
-    d["low_off_open"]  = d["low"]  - d["open"]
-    d["close_off_open"]= d["close"]- d["open"]
+    d["high_off_open"]  = d["high"] - d["open"]
+    d["low_off_open"]   = d["low"]  - d["open"]
+    d["close_off_open"] = d["close"]- d["open"]
     last_open = d["open"].iloc[-1]
     q = d[["high_off_open","low_off_open","close_off_open"]].tail(lookback).quantile(quantiles)
     rows = []
     for name in q.index:
         rows.append({
-            "quantile": float(name),
+            "quantile":       float(name),
             "forecast_high":  float(last_open + q.loc[name,"high_off_open"]),
             "forecast_low":   float(last_open + q.loc[name,"low_off_open"]),
             "forecast_close": float(last_open + q.loc[name,"close_off_open"]),
@@ -142,7 +138,7 @@ def quantile_forecast(daily, lookback=500, quantiles=[0.05,0.25,0.5,0.75,0.95]):
     return pd.DataFrame(rows)
 
 def tr_ar1_with_ci(daily, lookback=504):
-    if not STATS_OK: return None,None,None
+    if not STATS_AR_OK: return None,None,None
     d = daily.copy()
     trpct = (d["high"] - d["low"]) / d["close"] * 100
     s = trpct.tail(lookback).dropna()
@@ -154,37 +150,109 @@ def tr_ar1_with_ci(daily, lookback=504):
     se = np.sqrt(sigma2); z = 1.96
     return float(np.exp(pred_log)), float(np.exp(pred_log - z*se)), float(np.exp(pred_log + z*se))
 
-# ---- DENSITY (QuantiStat-style: price occurrence histogram → bands)
-def density_map_from_intraday(df, price_col="close", bins=160):
-    """
-    Build a horizontal histogram of intraday prices and extract band lines:
-    - median (50%), inner (25/75%), outer (5/95%) using CDF over price levels.
-    Returns centers, density, (median, inner_low, inner_high, outer_low, outer_high).
-    """
-    if price_col not in df.columns: return None, None, None
-    prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
-    if prices.empty: return None, None, None
+# ===== VW-KDE (no external deps): Silverman bandwidth + volume weights =====
+def _silverman_bandwidth(x: np.ndarray):
+    # Silverman's rule: 0.9 * min(sd, IQR/1.34) * n^{-1/5}
+    n = x.size
+    if n < 2: return np.nan
+    sd = np.std(x, ddof=1)
+    iqr = np.subtract(*np.percentile(x, [75, 25]))
+    a = min(sd, iqr/1.34) if (sd > 0 and iqr > 0) else (sd if sd>0 else (iqr/1.34 if iqr>0 else 1.0))
+    return 0.9 * a * (n ** (-1/5))
 
-    # Histogram of price occurrences (NOT normalized by time)
-    hist, edges = np.histogram(prices, bins=bins, density=True)
-    centers = (edges[:-1] + edges[1:]) / 2
+def vwkde_price_density(df, price_col="close", weight_col="volume", dt_col="datetime",
+                        grid_points=300, scope="session"):
+    """
+    VW-KDE over real prices for today's session (scope='session').
+    Returns:
+        grid (y), density (x), levels_dict (median, inner/outer), peaks (list of y's)
+    """
+    if price_col not in df.columns: return None, None, None, None
+    x = pd.to_numeric(df[price_col], errors="coerce")
+    tseries = df[dt_col]
+    mask = x.notna() & tseries.notna()
+    x = x[mask]; tseries = tseries[mask]
 
-    # CDF across ascending price
-    cdf = np.cumsum(hist)
+    if x.empty: return None, None, None, None
+
+    # Use the latest session (most recent date in data)
+    last_day = tseries.dt.date.max()
+    if scope == "session":
+        sess_mask = tseries.dt.date == last_day
+        x = x[sess_mask]
+
+    x = x.values.astype(float)
+    n = x.size
+    if n < 10: return None, None, None, None
+
+    # volume weights (optional)
+    if (weight_col in df.columns):
+        w = pd.to_numeric(df.loc[mask, weight_col], errors="coerce")
+        if scope == "session":
+            w = w[sess_mask]
+        w = w.fillna(0).values.astype(float)
+        if w.size != n:
+            w = None
+    else:
+        w = None
+
+    # bandwidth
+    h = _silverman_bandwidth(x)
+    if not np.isfinite(h) or h <= 0:
+        # fallback to small fraction of price std
+        h = max(np.std(x) * 0.2, 1e-6)
+
+    # evaluation grid
+    ymin, ymax = float(np.min(x)), float(np.max(x))
+    # expand slightly to avoid cutting tails
+    pad = 0.02 * (ymax - ymin if ymax > ymin else max(abs(ymax), 1.0))
+    ymin -= pad; ymax += pad
+    grid = np.linspace(ymin, ymax, grid_points)
+
+    # VW-KDE: f(x) = 1/(h * sum w) * sum w_i * phi((x - x_i)/h)
+    # Vectorized computation
+    diffs = (grid[:, None] - x[None, :]) / h
+    gauss = np.exp(-0.5 * diffs**2) / np.sqrt(2*np.pi)
+    if w is None:
+        dens = gauss.mean(axis=1) / h
+    else:
+        wpos = np.clip(w, 0, None)
+        wsum = np.sum(wpos)
+        if wsum <= 0:
+            dens = gauss.mean(axis=1) / h
+        else:
+            dens = (gauss @ wpos) / (wsum * h)
+
+    # Normalize density so area under curve ~1 on the grid (approx)
+    # (not strictly needed for quantiles since we use CDF over grid)
+    dens = np.clip(dens, 0, None)
+
+    # CDF & quantile levels (outer: 5/95, inner: 25/75, median: 50)
+    cdf = np.cumsum(dens)
     cdf = cdf / cdf[-1]
+    def q_at(p):
+        idx = int(np.searchsorted(cdf, p))
+        idx = np.clip(idx, 0, grid.size-1)
+        return float(grid[idx])
 
-    def level_at(p):
-        idx = np.searchsorted(cdf, p)
-        idx = np.clip(idx, 0, len(centers)-1)
-        return float(centers[idx])
+    levels = {
+        "outer_low":  q_at(0.05),
+        "inner_low":  q_at(0.25),
+        "median":     q_at(0.50),
+        "inner_high": q_at(0.75),
+        "outer_high": q_at(0.95),
+    }
 
-    median_line   = level_at(0.50)
-    inner_low     = level_at(0.25)
-    inner_high    = level_at(0.75)
-    outer_low     = level_at(0.05)
-    outer_high    = level_at(0.95)
+    # Peak detection (local maxima above a prominence threshold)
+    # Simple discrete derivative test with minimum prominence
+    peaks = []
+    dens_sm = pd.Series(dens).rolling(3, center=True, min_periods=1).mean().values
+    thr = np.percentile(dens_sm, 70)  # only significant peaks
+    for i in range(1, len(dens_sm)-1):
+        if dens_sm[i] > dens_sm[i-1] and dens_sm[i] > dens_sm[i+1] and dens_sm[i] >= thr:
+            peaks.append(float(grid[i]))
 
-    return centers, hist, (median_line, inner_low, inner_high, outer_low, outer_high)
+    return grid, dens, levels, peaks
 
 # =========================
 # File handling
@@ -192,12 +260,12 @@ def density_map_from_intraday(df, price_col="close", bins=160):
 if uploaded is not None:
     raw_df, dt_guess = read_and_clean(uploaded)
 elif use_demo:
-    demo_csv = StringIO("""datetime,open,high,low,close
-2025-01-02 09:30:00,6060,6065,6055,6062.50
-2025-01-02 09:31:00,6062.50,6068,6060,6066.84
-2025-01-02 09:32:00,6066.84,6072,6064,6069.10
-2025-01-02 09:33:00,6069.10,6075,6066,6072.00
-2025-01-02 09:34:00,6072.00,6076,6068,6074.50
+    demo_csv = StringIO("""datetime,open,high,low,close,volume
+2025-01-02 09:30:00,6060,6065,6055,6062.50,900
+2025-01-02 09:31:00,6062.50,6068,6060,6066.84,1100
+2025-01-02 09:32:00,6066.84,6072,6064,6069.10,1040
+2025-01-02 09:33:00,6069.10,6075,6066,6072.00,860
+2025-01-02 09:34:00,6072.00,6076,6068,6074.50,920
 """)
     raw_df, dt_guess = read_and_clean(demo_csv)
 else:
@@ -207,13 +275,23 @@ else:
 # Column mapping
 cols = raw_df.columns.tolist()
 st.sidebar.markdown("#### Column mapping")
-open_col  = st.sidebar.selectbox("open",  cols, index=cols.index(next((c for c in cols if c.startswith("open")),  "open")))
-high_col  = st.sidebar.selectbox("high",  cols, index=cols.index(next((c for c in cols if c.startswith("high")),  "high")))
-low_col   = st.sidebar.selectbox("low",   cols, index=cols.index(next((c for c in cols if c.startswith("low")),   "low")))
-close_col = st.sidebar.selectbox("close", cols, index=cols.index(next((c for c in cols if c.startswith("close")), "close")))
-dt_col    = st.sidebar.selectbox("datetime", cols, index=cols.index(dt_guess))
+def _idx(cols, name, fallback):
+    try:
+        return cols.index(name)
+    except Exception:
+        # try first starting with name
+        for i,c in enumerate(cols):
+            if c.startswith(name): return i
+        return cols.index(fallback) if fallback in cols else 0
 
-price_cols = {"open": open_col, "high": high_col, "low": low_col, "close": close_col}
+open_col  = st.sidebar.selectbox("open",  cols, index=_idx(cols,"open","open"))
+high_col  = st.sidebar.selectbox("high",  cols, index=_idx(cols,"high","high"))
+low_col   = st.sidebar.selectbox("low",   cols, index=_idx(cols,"low","low"))
+close_col = st.sidebar.selectbox("close", cols, index=_idx(cols,"close","close"))
+dt_col    = st.sidebar.selectbox("datetime", cols, index=_idx(cols, dt_guess, "datetime"))
+vol_col   = "volume" if "volume" in cols else None
+
+price_cols = {"open":open_col, "high":high_col, "low":low_col, "close":close_col}
 
 # Level Validator input
 levels = []
@@ -231,7 +309,7 @@ if mode == "✔ Level Validator":
 with st.spinner("Aggregating daily OHLC…"):
     daily = make_daily(raw_df, dt_col, price_cols)
 if daily.empty:
-    st.error("No valid daily OHLC rows after cleaning. Check mapping or CSV.")
+    st.error("No valid daily OHLC rows after cleaning. Check mapping/CSV.")
     st.stop()
 
 st.subheader("📅 Daily OHLC — sample")
@@ -257,42 +335,80 @@ with cB:
     st.plotly_chart(fig2, use_container_width=True)
 
 # =========================
-# Density Map — QuantiStat style (horizontal histogram + bands)
+# Density Map — VW-KDE (session-only, volume-weighted, shaded bands + peaks)
 # =========================
-st.subheader("Density Map — Zone Based")
-centers, density, bands = density_map_from_intraday(raw_df.rename(columns={close_col:"close"}), price_col="close", bins=160)
-if centers is not None:
-    median_line, inner_low, inner_high, outer_low, outer_high = bands
+st.subheader("Density Map — VW-KDE (Session, Volume-Weighted)")
 
+grid, dens, levels_dict, peaks = vwkde_price_density(
+    raw_df.rename(columns={close_col:"close", dt_col:"datetime", (vol_col or "volume"):(vol_col or "volume")}),
+    price_col="close",
+    weight_col=(vol_col or "volume"),
+    dt_col="datetime",
+    grid_points=400,
+    scope="session"
+)
+
+if grid is not None:
+    median = levels_dict["median"]
+    il, ih = levels_dict["inner_low"], levels_dict["inner_high"]
+    ol, oh = levels_dict["outer_low"], levels_dict["outer_high"]
+
+    # Plot: density curve (horizontal), with shaded inner & outer bands, median, peaks
     figZ = go.Figure()
 
-    # Horizontal histogram of price occurrence
-    figZ.add_trace(go.Bar(
-        y=centers, x=density, orientation="h",
-        marker=dict(color="#6b7280"), opacity=0.55, name="Density"
+    # KDE density curve
+    figZ.add_trace(go.Scatter(
+        x=dens, y=grid, mode="lines", name="VW-KDE",
+        line=dict(color="#9ca3af", width=2)
+    ))
+    # Fill under curve
+    figZ.add_trace(go.Scatter(
+        x=dens, y=grid, fill='tozerox', mode='none',
+        fillcolor="rgba(156,163,175,0.20)", name="Density"
     ))
 
-    # Band lines at actual MNQ prices
-    figZ.add_hline(y=median_line, line=dict(color="#22c55e", width=2), annotation_text=f"Median {median_line:.2f}", annotation_position="left")
-    figZ.add_hline(y=inner_low,  line=dict(color="white", width=1, dash="dash"), annotation_text=f"Inner {inner_low:.2f}", annotation_position="left")
-    figZ.add_hline(y=inner_high, line=dict(color="white", width=1, dash="dash"), annotation_text=f"Inner {inner_high:.2f}", annotation_position="left")
-    figZ.add_hline(y=outer_low,  line=dict(color="white", width=1, dash="dot"),  annotation_text=f"Outer {outer_low:.2f}", annotation_position="left")
-    figZ.add_hline(y=outer_high, line=dict(color="white", width=1, dash="dot"),  annotation_text=f"Outer {outer_high:.2f}", annotation_position="left")
+    # Shaded bands: outer (5–95) & inner (25–75)
+    figZ.add_hrect(y0=ol, y1=oh, line_width=0, fillcolor="rgba(255,255,255,0.05)", layer="below")
+    figZ.add_hrect(y0=il, y1=ih, line_width=0, fillcolor="rgba(34,197,94,0.10)", layer="below")
+
+    # Lines: outer/inner/median
+    figZ.add_hline(y=median, line=dict(color="#22c55e", width=2), annotation_text=f"Median {median:.2f}", annotation_position="left")
+    figZ.add_hline(y=il, line=dict(color="white", width=1, dash="dash"), annotation_text=f"Inner {il:.2f}", annotation_position="left")
+    figZ.add_hline(y=ih, line=dict(color="white", width=1, dash="dash"), annotation_text=f"Inner {ih:.2f}", annotation_position="left")
+    figZ.add_hline(y=ol, line=dict(color="white", width=1, dash="dot"),  annotation_text=f"Outer {ol:.2f}", annotation_position="left")
+    figZ.add_hline(y=oh, line=dict(color="white", width=1, dash="dot"),  annotation_text=f"Outer {oh:.2f}", annotation_position="left")
+
+    # Peaks (modes)
+    if peaks:
+        figZ.add_trace(go.Scatter(
+            x=[np.interp(p, grid, dens) for p in peaks],
+            y=peaks,
+            mode="markers",
+            name="Modes",
+            marker=dict(size=8, color="#60a5fa", line=dict(color="white", width=1))
+        ))
 
     figZ.update_layout(
-        title="Density Map — Zone Based",
-        xaxis_title="Density",
-        yaxis_title="MNQ Price",
+        title="VW-KDE Price Density (Session) — Inner/Outer Bands + Median + Modes",
+        xaxis_title="Density (volume-weighted KDE)", yaxis_title="Price",
         paper_bgcolor="#000000", plot_bgcolor="#000000",
         font=dict(color="white"),
-        bargap=0
+        showlegend=True
     )
     st.plotly_chart(figZ, use_container_width=True)
+
+    # Numeric levels table (for precision entries)
+    levels_df = pd.DataFrame([{
+        "Outer Low (5%)": ol, "Inner Low (25%)": il,
+        "Median (50%)": median,
+        "Inner High (75%)": ih, "Outer High (95%)": oh
+    }]).T.rename(columns={0:"Price"})
+    st.dataframe(levels_df.style.format({"Price":"{:.2f}"}))
 else:
-    st.info("Not enough data to compute density map.")
+    st.info("Not enough data to compute VW-KDE for the latest session.")
 
 # =========================
-# Modes
+# Modes: Level Validator
 # =========================
 if mode == "✔ Level Validator":
     st.subheader("Level Validator")
@@ -308,7 +424,7 @@ if mode == "✔ Level Validator":
         st.dataframe(pd.DataFrame(rows))
 
 # =========================
-# Forecasting (defaults to 2 years lookback)
+# Forecasting (default 2Y lookback)
 # =========================
 st.subheader("Quantile Forecast (applied to last open)")
 qdf = quantile_forecast(daily, lookback=lookback_days, quantiles=[0.05,0.25,0.5,0.75,0.95])
@@ -324,7 +440,7 @@ else:
 # Next-day True Range (percent & points)
 # =========================
 st.subheader("Next-day True Range")
-if STATS_OK:
+if STATS_AR_OK:
     pred_pct, lo_pct, hi_pct = tr_ar1_with_ci(daily, lookback=lookback_days)
     if pred_pct is None:
         tr_hist = (daily["high"] - daily["low"]).div(daily["close"])*100
